@@ -1,0 +1,346 @@
+import os
+import re
+import random
+import pandas as pd
+import numpy as np
+from ete3 import Tree
+from collections import Counter
+from multiprocessing import Pool
+
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[\\/*?:\"<>|]+", "_", str(name))
+
+
+def parse_tree(tree_file: str) -> Tree:
+    return Tree(tree_file, format=1)
+
+
+def sort_sequences_by_tree(tree_order_index: dict[str, int], sequences: list[str]) -> list[str]:
+    # sequences are assumed all in tree_order_index; if not, put at end
+    return sorted(sequences, key=lambda s: tree_order_index.get(s, 10**18))
+
+
+# ----------------------------
+# Connectivity
+# ----------------------------
+
+def calculate_connectivity(sequences: list[str], habitats: dict[str, str]) -> int:
+    """Number of adjacent habitat changes in a circular sequence."""
+    n = len(sequences)
+    if n == 0:
+        return 0
+    c = 0
+    for i in range(n):
+        if habitats[sequences[i]] != habitats[sequences[(i + 1) % n]]:
+            c += 1
+    return c
+
+
+def calculate_standard_connectivity_from_habitats(hab_list: list[str]) -> tuple[int, int]:
+    """
+    hab_list: habitats of sampled sequences (just labels)
+    min connectivity: group same habitats
+    max connectivity: alternate habitats
+    """
+    if not hab_list:
+        return 0, 0
+
+    counts = Counter(hab_list)
+    habs_sorted = sorted(counts.keys())
+
+    # min arrangement: AAA...BBB...CCC...
+    min_habs = []
+    for h in habs_sorted:
+        min_habs.extend([h] * counts[h])
+
+    # max arrangement: round-robin
+    max_habs = []
+    counts2 = counts.copy()
+    while sum(counts2.values()) > 0:
+        for h in habs_sorted:
+            if counts2[h] > 0:
+                max_habs.append(h)
+                counts2[h] -= 1
+
+    # compute connectivity on virtual sequence ids
+    min_map = {f"S{i}": min_habs[i] for i in range(len(min_habs))}
+    max_map = {f"S{i}": max_habs[i] for i in range(len(max_habs))}
+    min_conn = calculate_connectivity(list(min_map.keys()), min_map)
+    max_conn = calculate_connectivity(list(max_map.keys()), max_map)
+    return min_conn, max_conn
+
+
+def normalize_connectivity(conn: float, min_conn: float, max_conn: float, max_sample_size: int) -> float:
+    if max_sample_size <= 0:
+        return 0.0
+    if max_conn != min_conn:
+        return float(((conn - min_conn) / (max_conn - min_conn)) * (1 - 1 / max_sample_size) + 1 / max_sample_size)
+    return float(1 / max_sample_size)
+
+
+# ----------------------------
+# Tie-handling
+# ----------------------------
+
+def build_equivalent_group_map_by_root_distance(
+    tree: Tree,
+    sequences: list[str],
+    eps: float
+) -> dict[str, int]:
+    """
+    Return: seq -> group_id
+    group_id is determined by (distance_root_to_leaf / eps) rounding.
+    eps controls how close is considered "indistinguishable".
+    """
+    if eps <= 0:
+        eps = 1e-12
+
+    group_map = {}
+    for seq in sequences:
+        nodes = tree.search_nodes(name=seq)
+        if not nodes:
+            continue
+        leaf = nodes[0]
+        d = float(leaf.get_distance(tree))  # root -> leaf distance
+        gid = int(round(d / eps))
+        group_map[seq] = gid
+    return group_map
+
+
+def shuffle_within_equivalent_groups(
+    ordered_sequences: list[str],
+    group_map: dict[str, int],
+    rng: random.Random
+) -> list[str]:
+    """
+    Shuffle sequences inside each equivalent group while keeping group positions.
+    """
+    idx_by_gid = {}
+    for idx, seq in enumerate(ordered_sequences):
+        gid = group_map.get(seq, None)
+        if gid is None:
+            continue
+        idx_by_gid.setdefault(gid, []).append(idx)
+
+    out = list(ordered_sequences)
+    for gid, idxs in idx_by_gid.items():
+        if len(idxs) <= 1:
+            continue
+        vals = [out[i] for i in idxs]
+        rng.shuffle(vals)
+        for i, v in zip(idxs, vals):
+            out[i] = v
+    return out
+
+
+# ----------------------------
+# Sampling: Random
+# ----------------------------
+
+def balanced_random_sample_by_habitat(
+    df: pd.DataFrame,
+    per_hab: int,
+    rng: random.Random,
+    tree_leaf_set: set[str]
+) -> tuple[list[str], dict[str, str], dict[str, int]]:
+    """
+    Randomly sample per_hab sequences from each habitat (balanced).
+    Only keep sequences that exist in the tree.
+    Returns:
+      sampled_sequences, habitats_map(seq->hab), missing_stats
+    """
+    sampled = []
+    habitats_map = {}
+    missing_stats = {"missing_in_tree": 0}
+
+    for hab, sub in df.groupby("Habitats"):
+        seqs = sub["Sequence"].astype(str).tolist()
+        seqs_in_tree = [s for s in seqs if s in tree_leaf_set]
+        missing_stats["missing_in_tree"] += (len(seqs) - len(seqs_in_tree))
+
+        if len(seqs_in_tree) < per_hab:
+                        pick = seqs_in_tree
+        else:
+            pick = rng.sample(seqs_in_tree, per_hab)
+
+        for s in pick:
+            sampled.append(s)
+            habitats_map[s] = str(hab)
+
+    return sampled, habitats_map, missing_stats
+
+
+# ----------------------------
+# Worker for multiprocessing
+# ----------------------------
+
+def process_one_filename(args: tuple) -> str:
+    """
+    Per File_name task. Save one xlsx.
+    """
+    (file_name, group_df, tree_newick, iterations, out_dir,
+     max_sample_size, seed_base, eps, tie_shuffle_reps) = args
+
+    tree = Tree(tree_newick, format=1)
+    leaf_names = tree.get_leaf_names()
+    tree_leaf_set = set(leaf_names)
+    tree_order_index = {leaf: i for i, leaf in enumerate(leaf_names)}
+
+    group_df = group_df.copy()
+    group_df["Sequence"] = group_df["Sequence"].astype(str)
+    group_df["Habitats"] = group_df["Habitats"].astype(str)
+
+       hab_available_counts = []
+    for hab, sub in group_df.groupby("Habitats"):
+        seqs = sub["Sequence"].tolist()
+        hab_available_counts.append(sum(1 for s in seqs if s in tree_leaf_set))
+
+    if not hab_available_counts:
+        per_hab = 0
+    else:
+        min_avail = int(min(hab_available_counts))
+        if max_sample_size == 0:
+            per_hab = min_avail
+        else:
+            per_hab = int(min(min_avail, max_sample_size))
+
+    results = []
+    for i in range(iterations):
+        rng = random.Random(f"{seed_base}|{file_name}|{i}")
+
+        if per_hab <= 0:
+            results.append({
+                "Iteration": i + 1,
+                "File_name": file_name,
+                "Per_habitat_sample_size": per_hab,
+                "Normalized_connectivity_avg": 0.0,
+                "Connectivity_raw_avg": 0.0,
+                "Missing_in_tree_in_sampling": 0,
+                "Sampled_sequences": []
+            })
+            continue
+
+        sampled, habitats_map, miss = balanced_random_sample_by_habitat(
+            group_df, per_hab, rng, tree_leaf_set
+        )
+
+          sampled_ordered = sort_sequences_by_tree(tree_order_index, sampled)
+
+          group_map = build_equivalent_group_map_by_root_distance(tree, sampled_ordered, eps=eps)
+
+        raw_scores = []
+        norm_scores = []
+
+        hab_list = [habitats_map[s] for s in sampled_ordered]
+        min_conn, max_conn = calculate_standard_connectivity_from_habitats(hab_list)
+
+        reps = max(1, int(tie_shuffle_reps))
+        for r in range(reps):
+             rng_rep = random.Random(f"{seed_base}|{file_name}|{i}|rep{r}")
+
+            shuffled = shuffle_within_equivalent_groups(sampled_ordered, group_map, rng_rep)
+            conn = calculate_connectivity(shuffled, habitats_map)
+            raw_scores.append(conn)
+            norm_scores.append(normalize_connectivity(conn, min_conn, max_conn, per_hab))
+
+        results.append({
+            "Iteration": i + 1,
+            "File_name": file_name,
+            "Per_habitat_sample_size": per_hab,
+            "Normalized_connectivity_avg": float(np.mean(norm_scores)),
+            "Normalized_connectivity_min": float(np.min(norm_scores)),
+            "Normalized_connectivity_max": float(np.max(norm_scores)),
+            "Connectivity_raw_avg": float(np.mean(raw_scores)),
+            "Connectivity_raw_min": float(np.min(raw_scores)),
+            "Connectivity_raw_max": float(np.max(raw_scores)),
+            "Missing_in_tree_in_sampling": int(miss["missing_in_tree"]),
+            "Sampled_sequences_tree_order": sampled_ordered,
+            "Note": f"Within-tie shuffled {reps} reps; ties by root-distance with eps={eps}"
+        })
+
+    df_out = pd.DataFrame(results)
+    safe = sanitize_filename(file_name)
+    out_path = os.path.join(out_dir, f"{safe}.xlsx")
+    df_out.to_excel(out_path, index=False)
+    return out_path
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def run_by_filename(
+    csv_file: str,
+    tree_file: str,
+    out_dir: str = "connectivity_results",
+    iterations: int = 10,
+    max_sample_size: int = 30,     # 0 => use min available per-habitat within each File_name
+    processes: int = 4,
+    seed_base: int = 20260207,
+    eps: float = 1e-12,            # tie tolerance for root-distance
+    tie_shuffle_reps: int = 20      # each iteration: shuffle ties reps times and average
+) -> list[str]:
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    df = pd.read_csv(csv_file)
+    required = {"File_name", "Sequence", "Habitats"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"lack: {missing}；include: {required}")
+
+    tree = parse_tree(tree_file)
+    tree_newick = tree.write(format=1)
+
+    tasks = []
+    for file_name, group_df in df.groupby("File_name", sort=False):
+        tasks.append((
+            file_name, group_df, tree_newick, iterations, out_dir,
+            max_sample_size, seed_base, eps, tie_shuffle_reps
+        ))
+
+    if processes == 1:
+        out_files = [process_one_filename(t) for t in tasks]
+    else:
+        with Pool(processes=processes) as pool:
+            out_files = pool.map(process_one_filename, tasks)
+
+    # Summary
+    summary = pd.DataFrame({
+        "File_name": [os.path.basename(p).replace(".xlsx", "") for p in out_files],
+        "Output_file": out_files
+    })
+    summary.to_csv(os.path.join(out_dir, "SUMMARY.csv"), index=False)
+
+    return out_files
+
+
+if __name__ == "__main__":
+    csv_file = "sequences.csv"
+    tree_file = "phylogenetic_tree.tree"
+    out_dir = "connectivity_results"
+
+    iterations = 999
+    max_sample_size = 30   
+    processes = 30
+
+    # tie handling params
+    eps = 1e-12            
+    tie_shuffle_reps = 20  
+
+    run_by_filename(
+        csv_file=csv_file,
+        tree_file=tree_file,
+        out_dir=out_dir,
+        iterations=iterations,
+        max_sample_size=max_sample_size,
+        processes=processes,
+        seed_base=20260207,
+        eps=eps,
+        tie_shuffle_reps=tie_shuffle_reps
+    )
